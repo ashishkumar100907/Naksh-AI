@@ -27,4 +27,6 @@ Thumbs.db
 
 # IDE/editor files
 .vscode/
-.idea/
+# Data logs & runtime uploads
+data/
+

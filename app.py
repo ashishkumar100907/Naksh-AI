@@ -1,17 +1,20 @@
 import base64
+import datetime
 import io
 import json
+import os
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import tensorflow as tf
 from PIL import Image
 
 from gradcam import make_gradcam_heatmap
-
 
 # ============================================================
 # PAGE CONFIG (NO EMOJIS)
@@ -23,13 +26,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Initialize page navigation state
+# Initialize session state variables
+# Initialize session state variables
 if "page" not in st.session_state:
     st.session_state["page"] = "intro"
 
+if "admin_authenticated" not in st.session_state:
+    st.session_state["admin_authenticated"] = False
+
+if "user_session_id" not in st.session_state:
+    st.session_state["user_session_id"] = f"User-{np.random.randint(10000, 99999)}"
 
 # ============================================================
-# PATHS & ASSETS
+# PATHS & PERSISTENT LOG STORAGE
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,6 +46,15 @@ MODEL_PATH = BASE_DIR / "model" / "best_model.keras"
 CLASS_NAMES_PATH = BASE_DIR / "model" / "class_names.json"
 CONFUSION_MATRIX_PATH = BASE_DIR / "model" / "confusion_matrix.png"
 ASSETS_DIR = BASE_DIR / "assets"
+
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+UPLOADS_DIR = DATA_DIR / "uploaded_images"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+LOGS_FILE = DATA_DIR / "upload_logs.json"
+SESSIONS_FILE = DATA_DIR / "user_sessions.json"
 
 
 def get_base64_image(image_path):
@@ -61,13 +79,105 @@ star_b64 = get_base64_image(ASSETS_DIR / "star.jpg")
 
 
 # ============================================================
-# STYLES (PLANETARY & SPACE THEMED POPUP MODAL DIALOGS)
+# REAL-TIME LOGGING & USER SESSION TRACKING FUNCTIONS
+# ============================================================
+
+def load_user_sessions():
+    """Load persistent user session telemetry from JSON storage."""
+    if not SESSIONS_FILE.exists():
+        return {}
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_user_session(user_id):
+    """Register or update a user session heartbeat in persistent storage."""
+    sessions = load_user_sessions()
+    now_ts = time.time()
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if user_id not in sessions:
+        sessions[user_id] = {
+            "user_id": user_id,
+            "first_seen": now_str,
+            "last_seen_ts": now_ts,
+            "last_seen": now_str,
+            "tests_count": 0,
+        }
+    else:
+        sessions[user_id]["last_seen_ts"] = now_ts
+        sessions[user_id]["last_seen"] = now_str
+
+    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2)
+
+
+def record_user_test(user_id):
+    """Increment model test count for a specific user session."""
+    sessions = load_user_sessions()
+    if user_id in sessions:
+        sessions[user_id]["tests_count"] = sessions[user_id].get("tests_count", 0) + 1
+        sessions[user_id]["last_seen_ts"] = time.time()
+        sessions[user_id]["last_seen"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, indent=2)
+
+
+def get_user_statistics():
+    """Calculate real-time user session metrics (active users, total users)."""
+    sessions = load_user_sessions()
+    now_ts = time.time()
+    active_cutoff = 300  # 5 minutes active window
+    active_users = [
+        uid for uid, s in sessions.items()
+        if (now_ts - s.get("last_seen_ts", 0)) <= active_cutoff
+    ]
+    return {
+        "total_unique_users": max(1, len(sessions)),
+        "active_users_count": max(1, len(active_users)),
+        "sessions": sessions,
+    }
+
+
+# Register current user session heartbeat
+save_user_session(st.session_state["user_session_id"])
+
+
+def load_upload_logs():
+    """Load persistent upload and prediction audit logs from JSON storage."""
+    if not LOGS_FILE.exists():
+        return []
+    try:
+        with open(LOGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_upload_log(log_entry):
+    """Save a new prediction log entry into the persistent JSON storage."""
+    logs = load_upload_logs()
+    logs.insert(0, log_entry)  # Prepend newest logs first
+    with open(LOGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs, f, indent=2)
+
+
+def clear_upload_logs():
+    """Clear all audit logs from storage."""
+    with open(LOGS_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+
+# ============================================================
+# STYLES (PLANETARY & SPACE THEMED POPUP MODAL DIALOGS & ADMIN)
 # ============================================================
 
 st.markdown(
     f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Cinzel:wght@600;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Cinzel:wght@600;800&family=Fira+Code:wght@400;600&display=swap');
 
 /* GLOBAL RESETS & VARIABLES */
 :root {{
@@ -231,7 +341,7 @@ div[role="dialog"] button[aria-label="Close"]:hover {{
 .taskbar-metrics {{
     display: flex;
     align-items: center;
-    gap: 20px;
+    gap: 16px;
 }}
 
 .taskbar-chip {{
@@ -260,18 +370,202 @@ div[role="dialog"] button[aria-label="Close"]:hover {{
 
 
 /* ============================================================
+   ADMIN CONTROL CENTER CARD & LOGIN STYLES
+   ============================================================ */
+.admin-login-card {{
+    max-width: 480px;
+    margin: 40px auto;
+    background: linear-gradient(135deg, rgba(13, 18, 38, 0.95) 0%, rgba(22, 28, 60, 0.9) 100%);
+    border: 2px solid rgba(236, 72, 153, 0.5);
+    border-radius: 28px;
+    padding: 36px 32px;
+    box-shadow: 0 0 50px rgba(236, 72, 153, 0.3), inset 0 0 20px rgba(236, 72, 153, 0.1);
+    backdrop-filter: blur(20px);
+    text-align: center;
+}}
+
+.admin-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    border-radius: 99px;
+    background: rgba(236, 72, 153, 0.15);
+    border: 1px solid rgba(236, 72, 153, 0.4);
+    color: #f472b6;
+    font-size: 0.75rem;
+    font-weight: 800;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+}}
+
+.admin-title {{
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: #ffffff;
+    margin-bottom: 8px;
+    letter-spacing: -0.01em;
+}}
+
+.admin-sub {{
+    font-size: 0.88rem;
+    color: #94a3b8;
+    margin-bottom: 24px;
+    line-height: 1.5;
+}}
+
+.admin-metric-card {{
+    background: linear-gradient(135deg, rgba(15, 23, 42, 0.8) 0%, rgba(30, 41, 59, 0.7) 100%);
+    border: 1px solid rgba(139, 92, 246, 0.3);
+    border-radius: 20px;
+    padding: 18px 22px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+    height: 100%;
+}}
+
+.admin-metric-val {{
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: #ffffff;
+    line-height: 1.1;
+    margin-top: 4px;
+}}
+
+.admin-metric-lbl {{
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    color: #a78bfa;
+    text-transform: uppercase;
+}}
+
+.admin-log-table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 0.85rem;
+}}
+
+.admin-log-table th {{
+    background: rgba(139, 92, 246, 0.2);
+    color: #c084fc;
+    padding: 12px 14px;
+    text-align: left;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border-bottom: 1px solid rgba(139, 92, 246, 0.3);
+}}
+
+.admin-log-table td {{
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    color: #cbd5e1;
+}}
+
+/* ============================================================
    INTRO LANDING PAGE STYLES
    ============================================================ */
+/* ============================================================
+   INTRO LANDING PAGE STYLES (MATCHING REFERENCE DESIGN)
+   ============================================================ */
+@keyframes floatHero {{
+    0%, 100% {{ transform: translateY(0px); }}
+    50% {{ transform: translateY(-7px); }}
+}}
+
+@keyframes pulseTitleGlow {{
+    0%, 100% {{ filter: drop-shadow(0 0 25px rgba(139, 92, 246, 0.4)); }}
+    50% {{ filter: drop-shadow(0 0 45px rgba(139, 92, 246, 0.75)); }}
+}}
+
+@keyframes bounceScroll {{
+    0%, 100% {{ transform: translateY(0px); opacity: 0.7; }}
+    50% {{ transform: translateY(5px); opacity: 1.0; }}
+}}
+
+.intro-floating-header {{
+    position: relative;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    z-index: 100;
+    margin-bottom: -55px;
+}}
+
+.intro-brand-wrapper {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}}
+
+.intro-logo-glow {{
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: radial-gradient(circle, #8b5cf6 0%, #3b82f6 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+}}
+
+.intro-brand-title {{
+    font-size: 1.4rem;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    color: #ffffff;
+    line-height: 1;
+}}
+
+.intro-brand-sub {{
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    color: #94a3b8;
+    text-transform: uppercase;
+    margin-top: 3px;
+}}
+
+.intro-system-badge {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(52, 211, 153, 0.35);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.16em;
+    color: #34d399;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+}}
+
+.intro-green-pulse {{
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #34d399;
+    box-shadow: 0 0 8px #34d399;
+    animation: pulse 1.8s infinite;
+}}
+
 .intro-hero-wrapper {{
     position: relative;
     width: 100%;
-    margin-top: -35px;
+    margin-top: -45px;
     display: flex;
     flex-direction: column;
     align-items: center;
     text-align: center;
     z-index: 10;
     pointer-events: none;
+    animation: floatHero 6s ease-in-out infinite;
 }}
 
 .intro-welcome-line {{
@@ -279,41 +573,41 @@ div[role="dialog"] button[aria-label="Close"]:hover {{
     align-items: center;
     justify-content: center;
     gap: 16px;
-    font-size: 0.82rem;
+    font-size: 0.85rem;
     font-weight: 700;
-    letter-spacing: 0.35em;
-    color: #a78bfa;
+    letter-spacing: 0.38em;
+    color: #c4b5fd;
     text-transform: uppercase;
     margin-bottom: 8px;
 }}
 
 .intro-welcome-line::before, .intro-welcome-line::after {{
     content: "";
-    width: 65px;
+    width: 75px;
     height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(167, 139, 250, 0.6));
+    background: linear-gradient(90deg, transparent, rgba(196, 181, 253, 0.6));
 }}
 
 .intro-welcome-line::after {{
-    background: linear-gradient(90deg, rgba(167, 139, 250, 0.6), transparent);
+    background: linear-gradient(90deg, rgba(196, 181, 253, 0.6), transparent);
 }}
 
 .intro-main-title {{
-    font-size: clamp(3.4rem, 8vw, 6.5rem);
+    font-size: clamp(3.6rem, 8.5vw, 6.8rem);
     font-weight: 900;
     line-height: 1.02;
     letter-spacing: 0.04em;
     margin: 4px 0 12px 0;
-    background: linear-gradient(180deg, #ffffff 25%, #a78bfa 75%, #60a5fa 100%);
+    background: linear-gradient(180deg, #ffffff 30%, #c4b5fd 75%, #8b5cf6 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    filter: drop-shadow(0 0 35px rgba(139, 92, 246, 0.5));
+    animation: pulseTitleGlow 4s ease-in-out infinite;
 }}
 
 .intro-subtitle {{
     font-size: 1.15rem;
     font-weight: 800;
-    letter-spacing: 0.38em;
+    letter-spacing: 0.42em;
     color: #818cf8;
     text-transform: uppercase;
     margin-bottom: 22px;
@@ -329,7 +623,7 @@ div[role="dialog"] button[aria-label="Close"]:hover {{
 }}
 
 /* ============================================================
-   BEGIN JOURNEY BUTTON - MATCHING NASA VIBRANT COSMIC LINK CARD EFFECTS
+   VIBRANT NASA GLOWING CARD BUTTON DESIGN SYSTEM
    ============================================================ */
 div[data-testid="stColumn"] > div {{
     display: flex !important;
@@ -352,25 +646,25 @@ div[data-testid="stColumn"] div.stButton {{
     width: 100% !important;
 }}
 
-.stButton > button[key="btn_begin_journey"] {{
+.stButton > button {{
     background: linear-gradient(135deg, rgba(6, 182, 212, 0.45) 0%, rgba(59, 130, 246, 0.55) 50%, rgba(139, 92, 246, 0.5) 100%) !important;
-    border: 2px solid rgba(56, 189, 248, 0.85) !important;
+    border: 1.8px solid rgba(56, 189, 248, 0.85) !important;
     border-radius: 999px !important;
     padding: 16px 48px !important;
-    height: 64px !important;
-    font-size: 1.12rem !important;
+    height: 60px !important;
+    font-size: 1.08rem !important;
     font-weight: 800 !important;
     letter-spacing: 0.22em !important;
     color: #ffffff !important;
     box-shadow: 
-        0 0 0 4px rgba(139, 92, 246, 0.25),
-        0 0 40px rgba(6, 182, 212, 0.6),
-        0 15px 35px rgba(0, 0, 0, 0.7),
-        inset 0 0 20px rgba(255, 255, 255, 0.3) !important;
+        0 0 0 3px rgba(139, 92, 246, 0.25),
+        0 0 30px rgba(6, 182, 212, 0.6),
+        0 10px 30px rgba(0, 0, 0, 0.6),
+        inset 0 0 15px rgba(255, 255, 255, 0.3) !important;
     backdrop-filter: blur(16px) !important;
     margin: 0 auto !important;
     width: 100% !important;
-    max-width: 340px !important;
+    max-width: 360px !important;
     display: flex !important;
     justify-content: center !important;
     align-items: center !important;
@@ -380,15 +674,16 @@ div[data-testid="stColumn"] div.stButton {{
     transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }}
 
-.stButton > button[key="btn_begin_journey"]:hover {{
-    background: linear-gradient(135deg, rgba(6, 182, 212, 0.8) 0%, rgba(59, 130, 246, 0.85) 50%, rgba(139, 92, 246, 0.8) 100%) !important;
+.stButton > button:hover {{
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.85) 0%, rgba(59, 130, 246, 0.9) 50%, rgba(139, 92, 246, 0.85) 100%) !important;
     border-color: #ffffff !important;
-    transform: translateY(-5px) scale(1.06) !important;
+    color: #ffffff !important;
+    transform: translateY(-4px) scale(1.04) !important;
     box-shadow: 
-        0 0 0 6px rgba(56, 189, 248, 0.4),
-        0 0 65px rgba(6, 182, 212, 0.95),
-        0 20px 45px rgba(0, 0, 0, 0.8),
-        inset 0 0 30px rgba(255, 255, 255, 0.6) !important;
+        0 0 0 5px rgba(56, 189, 248, 0.4),
+        0 0 50px rgba(6, 182, 212, 0.9),
+        0 15px 35px rgba(0, 0, 0, 0.8),
+        inset 0 0 25px rgba(255, 255, 255, 0.5) !important;
 }}
 
 .scroll-hint {{
@@ -398,14 +693,15 @@ div[data-testid="stColumn"] div.stButton {{
     gap: 8px;
     font-size: 0.75rem;
     font-weight: 700;
-    letter-spacing: 0.22em;
+    letter-spacing: 0.24em;
     color: #64748b;
     text-transform: uppercase;
-    margin-top: 14px;
+    margin-top: 16px;
     pointer-events: auto;
     cursor: pointer;
     transition: color 0.2s ease;
     text-align: center;
+    animation: bounceScroll 2.2s ease-in-out infinite;
 }}
 
 .scroll-hint:hover {{
@@ -479,25 +775,27 @@ section[data-testid="stSidebar"] * {{
     margin: 22px 0 10px 4px;
 }}
 
-.stButton > button {{
+section[data-testid="stSidebar"] .stButton > button {{
     width: 100%;
-    border-radius: 12px;
-    height: 44px;
-    font-weight: 700;
-    font-size: 0.85rem;
-    letter-spacing: 0.03em;
-    background: rgba(255, 255, 255, 0.03) !important;
-    border: 1px solid rgba(255, 255, 255, 0.08) !important;
-    color: #cbd5e1 !important;
-    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    border-radius: 999px !important;
+    height: 44px !important;
+    font-weight: 800 !important;
+    font-size: 0.85rem !important;
+    letter-spacing: 0.05em !important;
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.25) 0%, rgba(59, 130, 246, 0.3) 50%, rgba(139, 92, 246, 0.25) 100%) !important;
+    border: 1.5px solid rgba(56, 189, 248, 0.6) !important;
+    color: #f1f5f9 !important;
+    box-shadow: 0 0 18px rgba(6, 182, 212, 0.3), inset 0 0 10px rgba(255, 255, 255, 0.15) !important;
+    backdrop-filter: blur(12px) !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }}
 
-.stButton > button:hover {{
-    background: linear-gradient(90deg, rgba(139, 92, 246, 0.25) 0%, rgba(59, 130, 246, 0.2) 100%) !important;
-    border-color: rgba(167, 139, 250, 0.6) !important;
+section[data-testid="stSidebar"] .stButton > button:hover {{
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.7) 0%, rgba(59, 130, 246, 0.75) 50%, rgba(139, 92, 246, 0.7) 100%) !important;
+    border-color: #ffffff !important;
     color: #ffffff !important;
-    transform: translateX(4px) !important;
-    box-shadow: 0 0 15px rgba(139, 92, 246, 0.3) !important;
+    transform: translateX(4px) scale(1.02) !important;
+    box-shadow: 0 0 35px rgba(6, 182, 212, 0.85), inset 0 0 18px rgba(255, 255, 255, 0.4) !important;
 }}
 
 .sb-status-card {{
@@ -778,7 +1076,7 @@ section[data-testid="stSidebar"] * {{
     margin-top: 2px;
 }}
 
-/* 🌖 MOON THEME HYPERLINK CARD (Orbital Lunar Silver Pill) */
+/* 🌖 MOON THEME HYPERLINK CARD */
 .cosmic-link-moon {{
     background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(71, 85, 105, 0.8) 100%);
     border: 1.8px solid rgba(226, 232, 240, 0.6);
@@ -798,7 +1096,7 @@ section[data-testid="stSidebar"] * {{
     box-shadow: 0 0 12px rgba(255, 255, 255, 0.8);
 }}
 
-/* 🌌 NEBULA THEME HYPERLINK CARD (H-Alpha Wave Capsule) */
+/* 🌌 NEBULA THEME HYPERLINK CARD */
 .cosmic-link-nebula {{
     background: linear-gradient(135deg, rgba(236, 72, 153, 0.35) 0%, rgba(168, 85, 247, 0.45) 50%, rgba(59, 130, 246, 0.4) 100%);
     border: 1.8px solid rgba(244, 114, 182, 0.7);
@@ -818,7 +1116,7 @@ section[data-testid="stSidebar"] * {{
     box-shadow: 0 0 15px #ec4899;
 }}
 
-/* 🪐 PLANET THEME HYPERLINK CARD (Saturnian Ring Capsule) */
+/* 🪐 PLANET THEME HYPERLINK CARD */
 .cosmic-link-planet {{
     background: linear-gradient(135deg, rgba(245, 158, 11, 0.35) 0%, rgba(217, 119, 6, 0.45) 50%, rgba(180, 83, 9, 0.4) 100%);
     border: 2px solid rgba(251, 191, 36, 0.8);
@@ -839,7 +1137,7 @@ section[data-testid="stSidebar"] * {{
     border: 1.5px solid #fef08a;
 }}
 
-/* ⭐ STAR THEME HYPERLINK CARD (Diffraction Glare Pill) */
+/* ⭐ STAR THEME HYPERLINK CARD */
 .cosmic-link-star {{
     background: linear-gradient(135deg, rgba(254, 240, 138, 0.3) 0%, rgba(245, 158, 11, 0.45) 50%, rgba(234, 88, 12, 0.4) 100%);
     border: 2px solid rgba(255, 255, 255, 0.85);
@@ -859,7 +1157,7 @@ section[data-testid="stSidebar"] * {{
     box-shadow: 0 0 20px #ffffff, 0 0 35px #f59e0b;
 }}
 
-/* 🌀 GALAXY & TECH HYPERLINK CARD (Spiral Vortex Capsule) */
+/* 🌀 GALAXY & TECH HYPERLINK CARD */
 .cosmic-link-galaxy {{
     background: linear-gradient(135deg, rgba(6, 182, 212, 0.35) 0%, rgba(59, 130, 246, 0.4) 50%, rgba(139, 92, 246, 0.4) 100%);
     border: 1.8px solid rgba(56, 189, 248, 0.75);
@@ -924,25 +1222,37 @@ section[data-testid="stSidebar"] * {{
 
 .primary-btn > button {{
     width: 100%;
-    border-radius: 99px;
-    height: 50px;
-    font-weight: 700;
-    font-size: 0.92rem;
-    letter-spacing: 0.05em;
-    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
-    border: none !important;
+    border-radius: 999px;
+    height: 56px;
+    font-weight: 800;
+    font-size: 1.02rem;
+    letter-spacing: 0.16em;
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.45) 0%, rgba(59, 130, 246, 0.55) 50%, rgba(139, 92, 246, 0.5) 100%) !important;
+    border: 1.8px solid rgba(56, 189, 248, 0.85) !important;
     color: #ffffff !important;
-    box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4) !important;
-    transition: all 0.25s ease !important;
+    box-shadow: 
+        0 0 0 3px rgba(139, 92, 246, 0.25),
+        0 0 30px rgba(6, 182, 212, 0.55),
+        0 8px 25px rgba(0, 0, 0, 0.6),
+        inset 0 0 15px rgba(255, 255, 255, 0.3) !important;
+    backdrop-filter: blur(16px) !important;
+    transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }}
 
 .primary-btn > button:hover {{
-    transform: translateY(-2px);
-    box-shadow: 0 8px 30px rgba(99, 102, 241, 0.6) !important;
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.85) 0%, rgba(59, 130, 246, 0.9) 50%, rgba(139, 92, 246, 0.85) 100%) !important;
+    border-color: #ffffff !important;
+    color: #ffffff !important;
+    transform: translateY(-3px) scale(1.02);
+    box-shadow: 
+        0 0 0 5px rgba(56, 189, 248, 0.4),
+        0 0 45px rgba(6, 182, 212, 0.85),
+        0 15px 35px rgba(0, 0, 0, 0.8),
+        inset 0 0 22px rgba(255, 255, 255, 0.45) !important;
 }}
 
 
-/* Timeline Items (How it works) */
+/* Timeline Items */
 .timeline {{
     display: flex;
     flex-direction: column;
@@ -1424,7 +1734,7 @@ def show_gradcam_dialog():
 # ============================================================
 
 def render_3d_solar_system():
-    """Render interactive photorealistic 3D WebGL solar system with huge radiant Sun and Keplerian planetary orbits."""
+    """Render interactive photorealistic 3D WebGL solar system with huge radiant Sun, shooting stars, and Keplerian planetary orbits."""
     html_code = """
     <!DOCTYPE html>
     <html>
@@ -1432,8 +1742,8 @@ def render_3d_solar_system():
         <meta charset="utf-8"/>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
-            body, html { width: 100%; height: 100%; overflow: hidden; background: #03050d; }
-            #webgl-container { width: 100%; height: 600px; position: relative; }
+            body, html { width: 100%; height: 100%; overflow: hidden; background: #02040a; }
+            #webgl-container { width: 100%; height: 620px; position: relative; }
         </style>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     </head>
@@ -1443,27 +1753,27 @@ def render_3d_solar_system():
             let scene, camera, renderer;
             let sun, coronaLayer1, coronaLayer2, coronaLayer3;
             let planets = [];
-            let starField;
+            let starField, galaxyArc;
+            let meteors = [];
             let mouseX = 0, mouseY = 0;
 
-            // HIGH-RESOLUTION PROCEDURAL PHOTOREALISTIC TEXTURE GENERATORS
             function createSunTexture() {
                 const canvas = document.createElement('canvas');
                 canvas.width = 2048; canvas.height = 1024;
                 const ctx = canvas.getContext('2d');
                 const grad = ctx.createLinearGradient(0, 0, 0, 1024);
-                grad.addColorStop(0, '#fff4cc');
-                grad.addColorStop(0.2, '#ffcc00');
-                grad.addColorStop(0.5, '#ff6600');
-                grad.addColorStop(0.85, '#cc1100');
-                grad.addColorStop(1, '#880000');
+                grad.addColorStop(0, '#ffffff');
+                grad.addColorStop(0.15, '#fffae0');
+                grad.addColorStop(0.35, '#ffb700');
+                grad.addColorStop(0.65, '#ff5500');
+                grad.addColorStop(0.88, '#cc1100');
+                grad.addColorStop(1, '#660000');
                 ctx.fillStyle = grad; ctx.fillRect(0, 0, 2048, 1024);
                 
-                // Convective Solar Flare Granulation & Sunspots
-                for(let i=0; i<85000; i++) {
-                    const alpha = Math.random() * 0.45;
-                    ctx.fillStyle = Math.random() > 0.45 ? `rgba(255,255,220,${alpha})` : `rgba(120,10,0,${alpha})`;
-                    ctx.fillRect(Math.random()*2048, Math.random()*1024, Math.random()*6+2, Math.random()*6+2);
+                for(let i=0; i<90000; i++) {
+                    const alpha = Math.random() * 0.5;
+                    ctx.fillStyle = Math.random() > 0.4 ? `rgba(255,255,240,${alpha})` : `rgba(180,20,0,${alpha})`;
+                    ctx.fillRect(Math.random()*2048, Math.random()*1024, Math.random()*5+2, Math.random()*5+2);
                 }
                 return new THREE.CanvasTexture(canvas);
             }
@@ -1472,17 +1782,17 @@ def render_3d_solar_system():
                 const canvas = document.createElement('canvas');
                 canvas.width = 1024; canvas.height = 512;
                 const ctx = canvas.getContext('2d');
-                ctx.fillStyle = '#0a235c'; ctx.fillRect(0, 0, 1024, 512);
-                ctx.fillStyle = '#15803d';
-                for(let i=0; i<35; i++) {
+                ctx.fillStyle = '#0b2559'; ctx.fillRect(0, 0, 1024, 512);
+                ctx.fillStyle = '#166534';
+                for(let i=0; i<40; i++) {
                     ctx.beginPath();
-                    ctx.ellipse(Math.random()*1024, Math.random()*360+76, Math.random()*140+40, Math.random()*80+25, Math.random()*Math.PI, 0, Math.PI*2);
+                    ctx.ellipse(Math.random()*1024, Math.random()*360+76, Math.random()*150+40, Math.random()*90+25, Math.random()*Math.PI, 0, Math.PI*2);
                     ctx.fill();
                 }
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
-                for(let i=0; i<50; i++) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                for(let i=0; i<60; i++) {
                     ctx.beginPath();
-                    ctx.ellipse(Math.random()*1024, Math.random()*512, Math.random()*180+50, Math.random()*30+10, Math.random()*0.4, 0, Math.PI*2);
+                    ctx.ellipse(Math.random()*1024, Math.random()*512, Math.random()*190+40, Math.random()*35+10, Math.random()*0.4, 0, Math.PI*2);
                     ctx.fill();
                 }
                 return new THREE.CanvasTexture(canvas);
@@ -1495,14 +1805,13 @@ def render_3d_solar_system():
                 for(let y=0; y<512; y++) {
                     const noise = Math.sin(y * 0.08) * 0.5 + 0.5;
                     const noise2 = Math.cos(y * 0.04) * 0.5 + 0.5;
-                    const r = Math.floor(210 + noise * 45);
-                    const g = Math.floor(130 + noise2 * 50);
-                    const b = Math.floor(75 + noise * 40);
+                    const r = Math.floor(215 + noise * 40);
+                    const g = Math.floor(135 + noise2 * 45);
+                    const b = Math.floor(80 + noise * 35);
                     ctx.fillStyle = `rgb(${r},${g},${b})`;
                     ctx.fillRect(0, y, 1024, 1);
                 }
-                // Great Red Spot
-                ctx.fillStyle = '#b91c1c';
+                ctx.fillStyle = '#991b1b';
                 ctx.beginPath();
                 ctx.ellipse(720, 320, 75, 45, 0, 0, Math.PI*2);
                 ctx.fill();
@@ -1515,11 +1824,11 @@ def render_3d_solar_system():
                 const ctx = canvas.getContext('2d');
                 const grad = ctx.createRadialGradient(512, 512, 100, 512, 512, 500);
                 grad.addColorStop(0, 'rgba(0,0,0,0)');
-                grad.addColorStop(0.25, 'rgba(217, 119, 6, 0.9)');
-                grad.addColorStop(0.48, 'rgba(245, 158, 11, 0.5)');
-                grad.addColorStop(0.52, 'rgba(0,0,0,0)'); // Cassini Division Gap
+                grad.addColorStop(0.25, 'rgba(217, 119, 6, 0.95)');
+                grad.addColorStop(0.48, 'rgba(245, 158, 11, 0.6)');
+                grad.addColorStop(0.52, 'rgba(0,0,0,0)');
                 grad.addColorStop(0.68, 'rgba(251, 191, 36, 0.95)');
-                grad.addColorStop(0.85, 'rgba(180, 83, 9, 0.7)');
+                grad.addColorStop(0.85, 'rgba(180, 83, 9, 0.75)');
                 grad.addColorStop(1, 'rgba(0,0,0,0)');
                 ctx.fillStyle = grad;
                 ctx.beginPath(); ctx.arc(512, 512, 500, 0, Math.PI*2); ctx.fill();
@@ -1540,7 +1849,6 @@ def render_3d_solar_system():
                 return new THREE.CanvasTexture(canvas);
             }
 
-            // PLANETARY DATA WITH KEPLERIAN ORBITS & ADVANCED AXIAL TILTS
             const planetData = [
                 { name: 'Mercury', radius: 0.55, a: 11.5, b: 10.8, speed: 0.024, tilt: 0.03, inclX: 0.12, base: '#a8a8a8', band: '#787878' },
                 { name: 'Venus', radius: 0.85, a: 15.2, b: 14.8, speed: 0.018, tilt: 3.1, inclX: 0.06, base: '#e3bb76', band: '#c49a52' },
@@ -1552,16 +1860,45 @@ def render_3d_solar_system():
                 { name: 'Neptune', radius: 1.15, a: 51.5, b: 50.5, speed: 0.002, tilt: 0.49, inclX: 0.03, base: '#2563eb', band: '#1d4ed8' }
             ];
 
+            function createShootingStar() {
+                const geo = new THREE.BufferGeometry();
+                const pos = new Float32Array([0, 0, 0, -7, 5, -7]);
+                geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                const mat = new THREE.LineBasicMaterial({
+                    color: 0xa5b4fc,
+                    transparent: true,
+                    opacity: 0.9
+                });
+                const star = new THREE.Line(geo, mat);
+                resetShootingStar(star);
+                scene.add(star);
+                meteors.push(star);
+            }
+
+            function resetShootingStar(star) {
+                star.position.set(
+                    (Math.random() - 0.5) * 260,
+                    Math.random() * 90 + 20,
+                    (Math.random() - 0.5) * 180
+                );
+                star.userData = {
+                    vx: -(Math.random() * 2.4 + 1.4),
+                    vy: -(Math.random() * 1.8 + 0.9),
+                    vz: -(Math.random() * 1.8 + 0.9),
+                    life: Math.random() * 55 + 30
+                };
+            }
+
             function init() {
                 const container = document.getElementById('webgl-container');
                 const width = container.clientWidth;
                 const height = container.clientHeight;
 
                 scene = new THREE.Scene();
-                scene.fog = new THREE.FogExp2(0x03050d, 0.006);
+                scene.fog = new THREE.FogExp2(0x02040a, 0.0045);
 
                 camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
-                camera.position.set(0, 26, 56);
+                camera.position.set(0, 24, 54);
                 camera.lookAt(0, 0, 0);
 
                 renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -1569,55 +1906,50 @@ def render_3d_solar_system():
                 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
                 container.appendChild(renderer.domElement);
 
-                // ILLUMINATION & LIGHTING
-                const ambientLight = new THREE.AmbientLight(0x475569, 1.8);
+                const ambientLight = new THREE.AmbientLight(0x475569, 2.0);
                 scene.add(ambientLight);
 
-                const sunLight = new THREE.PointLight(0xfffaed, 5.5, 300);
+                const sunLight = new THREE.PointLight(0xfffaed, 6.0, 350);
                 scene.add(sunLight);
 
-                // HUGE RADIANT PHOTOREALISTIC SUN (Central Glowing Body)
-                const sunRadius = 5.2; // BIGGER DOMINANT SUN
+                const sunRadius = 5.4;
                 const sunTex = createSunTexture();
                 const sunGeo = new THREE.SphereGeometry(sunRadius, 64, 64);
                 const sunMat = new THREE.MeshBasicMaterial({ map: sunTex });
                 sun = new THREE.Mesh(sunGeo, sunMat);
                 scene.add(sun);
 
-                // Multi-Layer Solar Corona Flares & Atmospheric Wind
-                const coronaGeo1 = new THREE.SphereGeometry(sunRadius * 1.15, 32, 32);
+                const coronaGeo1 = new THREE.SphereGeometry(sunRadius * 1.18, 32, 32);
                 const coronaMat1 = new THREE.MeshBasicMaterial({
-                    color: 0xffaa00,
+                    color: 0xffb700,
                     transparent: true,
-                    opacity: 0.5,
+                    opacity: 0.55,
                     side: THREE.BackSide
                 });
                 coronaLayer1 = new THREE.Mesh(coronaGeo1, coronaMat1);
                 sun.add(coronaLayer1);
 
-                const coronaGeo2 = new THREE.SphereGeometry(sunRadius * 1.35, 32, 32);
+                const coronaGeo2 = new THREE.SphereGeometry(sunRadius * 1.4, 32, 32);
                 const coronaMat2 = new THREE.MeshBasicMaterial({
                     color: 0xff4500,
                     transparent: true,
-                    opacity: 0.35,
+                    opacity: 0.4,
                     side: THREE.BackSide
                 });
                 coronaLayer2 = new THREE.Mesh(coronaGeo2, coronaMat2);
                 sun.add(coronaLayer2);
 
-                const coronaGeo3 = new THREE.SphereGeometry(sunRadius * 1.65, 32, 32);
+                const coronaGeo3 = new THREE.SphereGeometry(sunRadius * 1.75, 32, 32);
                 const coronaMat3 = new THREE.MeshBasicMaterial({
                     color: 0x8b5cf6,
                     transparent: true,
-                    opacity: 0.22,
+                    opacity: 0.25,
                     side: THREE.BackSide
                 });
                 coronaLayer3 = new THREE.Mesh(coronaGeo3, coronaMat3);
                 sun.add(coronaLayer3);
 
-                // PLANETS & KEPLERIAN 3D ORBITS
                 planetData.forEach((pd) => {
-                    // Generate 3D Elliptical Orbit Curve Line
                     const points = [];
                     for (let i = 0; i <= 128; i++) {
                         const theta = (i / 128) * Math.PI * 2;
@@ -1630,22 +1962,20 @@ def render_3d_solar_system():
                     const orbitMat = new THREE.LineBasicMaterial({
                         color: 0x818cf8,
                         transparent: true,
-                        opacity: 0.35
+                        opacity: 0.38
                     });
                     const orbitLine = new THREE.Line(orbitGeo, orbitMat);
                     scene.add(orbitLine);
 
-                    // Planet Texture Selection
                     let pTex;
                     if (pd.customTex === 'earth') pTex = createEarthTexture();
                     else if (pd.customTex === 'jupiter') pTex = createJupiterTexture();
                     else pTex = createGenericPlanetTexture(pd.base, pd.band);
 
-                    // Planet Mesh with Specular Material
                     const pGeo = new THREE.SphereGeometry(pd.radius, 32, 32);
                     const pMat = new THREE.MeshStandardMaterial({
                         map: pTex,
-                        roughness: 0.45,
+                        roughness: 0.4,
                         metalness: 0.15
                     });
                     const planet = new THREE.Mesh(pGeo, pMat);
@@ -1653,7 +1983,6 @@ def render_3d_solar_system():
 
                     scene.add(planet);
 
-                    // Saturn Rings
                     if (pd.hasRings) {
                         const ringTex = createSaturnRingTexture();
                         const ringGeo = new THREE.RingGeometry(pd.radius * 1.35, pd.radius * 2.8, 64);
@@ -1661,27 +1990,25 @@ def render_3d_solar_system():
                             map: ringTex,
                             side: THREE.DoubleSide,
                             transparent: true,
-                            opacity: 0.85
+                            opacity: 0.88
                         });
                         const ring = new THREE.Mesh(ringGeo, ringMat);
                         ring.rotation.x = Math.PI / 2.3;
                         planet.add(ring);
                     }
 
-                    // Earth Atmospheric Glow Shell
                     if (pd.hasAtmosphere) {
                         const atmosGeo = new THREE.SphereGeometry(pd.radius * 1.08, 32, 32);
                         const atmosMat = new THREE.MeshBasicMaterial({
                             color: 0x38bdf8,
                             transparent: true,
-                            opacity: 0.3,
+                            opacity: 0.35,
                             side: THREE.BackSide
                         });
                         const atmos = new THREE.Mesh(atmosGeo, atmosMat);
                         planet.add(atmos);
                     }
 
-                    // Earth Moon
                     if (pd.hasMoon) {
                         const moonGeo = new THREE.SphereGeometry(0.25, 16, 16);
                         const moonMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.8 });
@@ -1696,28 +2023,73 @@ def render_3d_solar_system():
                     planets.push(pd);
                 });
 
-                // 3D DEEP SPACE STARFIELD
+                // UNIFORM DENSE STAR FIELD DISTRIBUTED EQUALLY ACROSS THE ENTIRE VIEWPORT
                 const starsGeo = new THREE.BufferGeometry();
-                const starsCount = 3500;
+                const starsCount = 7000;
                 const starPositions = new Float32Array(starsCount * 3);
+                const starColors = new Float32Array(starsCount * 3);
 
-                for (let i = 0; i < starsCount * 3; i += 3) {
-                    starPositions[i] = (Math.random() - 0.5) * 450;
-                    starPositions[i + 1] = (Math.random() - 0.5) * 450;
-                    starPositions[i + 2] = (Math.random() - 0.5) * 450;
+                for (let i = 0; i < starsCount; i++) {
+                    const i3 = i * 3;
+                    starPositions[i3]     = (Math.random() - 0.5) * 800; // Wide X coverage
+                    starPositions[i3 + 1] = (Math.random() - 0.5) * 550; // High Y coverage
+                    starPositions[i3 + 2] = (Math.random() - 0.5) * 600 - 40; // Deep Z coverage
+
+                    const col = Math.random();
+                    if (col > 0.82) {
+                        starColors[i3] = 0.7; starColors[i3+1] = 0.85; starColors[i3+2] = 1.0;
+                    } else if (col > 0.65) {
+                        starColors[i3] = 1.0; starColors[i3+1] = 0.92; starColors[i3+2] = 0.75;
+                    } else {
+                        starColors[i3] = 0.95; starColors[i3+1] = 0.95; starColors[i3+2] = 1.0;
+                    }
                 }
 
                 starsGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+                starsGeo.setAttribute('color', new THREE.BufferAttribute(starColors, 3));
                 const starsMat = new THREE.PointsMaterial({
-                    color: 0xffffff,
-                    size: 0.75,
+                    size: 0.85,
+                    vertexColors: true,
                     transparent: true,
-                    opacity: 0.95
+                    opacity: 0.92
                 });
                 starField = new THREE.Points(starsGeo, starsMat);
                 scene.add(starField);
 
-                // MOUSE TILT CONTROLS
+                // Milky Way Galaxy Arc Dust
+                const galaxyGeo = new THREE.BufferGeometry();
+                const galaxyCount = 2400;
+                const galaxyPos = new Float32Array(galaxyCount * 3);
+                const galaxyColors = new Float32Array(galaxyCount * 3);
+                for(let i=0; i<galaxyCount; i++) {
+                    const t = (Math.random() - 0.5) * 240;
+                    galaxyPos[i*3] = t + 50;
+                    galaxyPos[i*3+1] = t * 0.45 + (Math.random() - 0.5) * 35 + 30;
+                    galaxyPos[i*3+2] = -60 + (Math.random() - 0.5) * 50;
+
+                    const c = Math.random();
+                    if (c > 0.5) {
+                        galaxyColors[i*3] = 0.65; galaxyColors[i*3+1] = 0.4; galaxyColors[i*3+2] = 0.98;
+                    } else {
+                        galaxyColors[i*3] = 0.2; galaxyColors[i*3+1] = 0.65; galaxyColors[i*3+2] = 0.95;
+                    }
+                }
+                galaxyGeo.setAttribute('position', new THREE.BufferAttribute(galaxyPos, 3));
+                galaxyGeo.setAttribute('color', new THREE.BufferAttribute(galaxyColors, 3));
+                const galaxyMat = new THREE.PointsMaterial({
+                    size: 1.3,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.8
+                });
+                galaxyArc = new THREE.Points(galaxyGeo, galaxyMat);
+                scene.add(galaxyArc);
+
+                // Spawn 16 Shooting Stars
+                for (let i = 0; i < 16; i++) {
+                    createShootingStar();
+                }
+
                 document.addEventListener('mousemove', (e) => {
                     mouseX = (e.clientX / window.innerWidth - 0.5) * 2;
                     mouseY = (e.clientY / window.innerHeight - 0.5) * 2;
@@ -1740,15 +2112,15 @@ def render_3d_solar_system():
             function animate() {
                 requestAnimationFrame(animate);
 
-                // Sun Dynamic Rotation & Corona Flare Pulsations
+                const time = Date.now() * 0.001;
+
                 if (sun) {
                     sun.rotation.y += 0.003;
-                    const pulseTime = Date.now() * 0.0015;
-                    coronaLayer1.scale.setScalar(1.0 + Math.sin(pulseTime) * 0.04);
-                    coronaLayer2.scale.setScalar(1.0 + Math.cos(pulseTime * 1.3) * 0.06);
+                    coronaLayer1.scale.setScalar(1.0 + Math.sin(time * 1.8) * 0.045);
+                    coronaLayer2.scale.setScalar(1.0 + Math.cos(time * 1.4) * 0.065);
+                    coronaLayer3.scale.setScalar(1.0 + Math.sin(time * 1.1) * 0.085);
                 }
 
-                // Planets 3D Keplerian Orbital Motion
                 planets.forEach((pd) => {
                     pd.angle += pd.speed * 0.85;
                     pd.mesh.position.x = Math.cos(pd.angle) * pd.a;
@@ -1762,11 +2134,25 @@ def render_3d_solar_system():
                     }
                 });
 
-                if (starField) starField.rotation.y += 0.0003;
+                if (starField) {
+                    starField.rotation.y += 0.0004;
+                    starField.rotation.x += 0.00015;
+                }
+                if (galaxyArc) galaxyArc.rotation.z += 0.0001;
 
-                // Interactive 3D Camera Floating Tilt
-                camera.position.x += (mouseX * 6.0 - camera.position.x) * 0.04;
-                camera.position.y += (-mouseY * 4.5 + 26 - camera.position.y) * 0.04;
+                meteors.forEach(m => {
+                    m.position.x += m.userData.vx;
+                    m.position.y += m.userData.vy;
+                    m.position.z += m.userData.vz;
+                    m.userData.life--;
+                    if (m.userData.life <= 0 || m.position.y < -60) {
+                        resetShootingStar(m);
+                    }
+                });
+
+                // Smooth camera motion with dynamic floating wave
+                camera.position.x += (mouseX * 7.0 + Math.sin(time * 0.6) * 1.2 - camera.position.x) * 0.035;
+                camera.position.y += (-mouseY * 5.0 + 24 + Math.cos(time * 0.8) * 1.0 - camera.position.y) * 0.035;
                 camera.lookAt(0, 0, 0);
 
                 renderer.render(scene, camera);
@@ -1785,30 +2171,29 @@ def render_3d_solar_system():
 # ============================================================
 
 def render_intro_page():
-    """Solar System Animated"""
-    # Top Astronomical Taskbar Header
+    """Solar System Animated Intro Landing Page matching exact reference layout."""
+    
+    # Floating Header Header Bar (No box wrap, floating over canvas)
     st.markdown(
         """
-        <div class="top-taskbar">
-            <div class="taskbar-brand">
-                <div class="taskbar-logo">
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <div class="intro-floating-header">
+            <div class="intro-brand-wrapper">
+                <div class="intro-logo-glow">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2">
                         <circle cx="12" cy="12" r="9"></circle>
                         <path d="M3.6 9h16.8"></path>
                         <path d="M3.6 15h16.8"></path>
-                        <circle cx="12" cy="12" r="3" fill="white"></circle>
+                        <circle cx="12" cy="12" r="3" fill="#a78bfa"></circle>
                     </svg>
                 </div>
                 <div>
-                    <div class="taskbar-title">NAKSH AI</div>
-                    <div class="taskbar-sub">Astronomical Intelligence</div>
+                    <div class="intro-brand-title">NAKSH <span style="color: #a78bfa;">AI</span></div>
+                    <div class="intro-brand-sub">ASTRONOMICAL INTELLIGENCE</div>
                 </div>
             </div>
-            <div class="taskbar-metrics">
-                <div class="taskbar-chip">
-                    <span class="taskbar-pulse"></span>
-                    3D ORBITAL SIMULATION
-                </div>
+            <div class="intro-system-badge">
+                <span class="intro-green-pulse"></span>
+                SYSTEM ONLINE
             </div>
         </div>
         """,
@@ -1818,7 +2203,7 @@ def render_intro_page():
     # 3D Solar System WebGL Canvas
     render_3d_solar_system()
 
-    # Central Text Overlay
+    # Central Hero Text Overlay below Sun
     st.markdown(
         """
         <div class="intro-hero-wrapper">
@@ -1833,22 +2218,493 @@ def render_intro_page():
         unsafe_allow_html=True,
     )
 
-    # DEAD-CENTER BUTTON USING 3 EQUAL STREAMLIT COLUMNS
+    # Primary CTA Button - Dead Center
     c1, c2, c3 = st.columns([1, 1.2, 1])
     with c2:
-        if st.button("BEGIN JOURNEY", key="btn_begin_journey", type="primary"):
+        if st.button("BEGIN JOURNEY  ➔", key="btn_begin_journey", type="primary"):
             st.session_state["page"] = "dashboard"
+            st.session_state.pop("jump_to_upload", None)
             st.rerun()
 
-    # Scroll hint
+    # Scroll hint at bottom
     st.markdown(
         """
         <div class="scroll-hint">
+            <svg width="14" height="18" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round">
+                <rect x="5" y="3" width="14" height="18" rx="7" ry="7"></rect>
+                <line x1="12" y1="7" x2="12" y2="11"></line>
+            </svg>
             SCROLL TO EXPLORE
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+# ============================================================
+# RENDER ADMIN CONTROL CENTER (PROTECTED BY PASSWORD 'admin123')
+# ============================================================
+
+def render_admin_page():
+    """Render Admin Control Center with real-time model analysis & audit logs."""
+    
+    # ------------------------------------------------------------
+    # ADMIN PASSWORD LOGIN CHECK (Password: admin123)
+    # ------------------------------------------------------------
+    if not st.session_state.get("admin_authenticated", False):
+        st.markdown(
+            """
+            <div class="admin-login-card">
+                <div class="admin-badge">SYSTEM SECURITY</div>
+                <div class="admin-title">NAKSH AI ADMIN PORTAL</div>
+                <div class="admin-sub">Restricted Access. Enter the administrator security key to unlock real-time user statistics, model telemetry, and prediction audit logs.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3 = st.columns([1, 1.2, 1])
+        with c2:
+            admin_pwd = st.text_input("Admin Password", type="password", key="admin_pwd_input", placeholder="Enter Admin Password...")
+            if st.button("UNLOCK ADMIN PANEL", type="primary", key="btn_admin_login"):
+                if admin_pwd == "admin123":
+                    st.session_state["admin_authenticated"] = True
+                    st.success("Authentication successful! Loading telemetry...")
+                    time.sleep(0.4)
+                    st.rerun()
+                else:
+                    st.error("Access Denied: Invalid Security Key!")
+            
+            st.write("")
+            if st.button("Return to User Dashboard", key="btn_admin_back_user"):
+                st.session_state["page"] = "dashboard"
+                st.rerun()
+        return
+
+    # ------------------------------------------------------------
+    # AUTHENTICATED ADMIN DASHBOARD
+    # ------------------------------------------------------------
+
+    # Fetch Real-Time User & Telemetry Stats
+    user_stats = get_user_statistics()
+    active_users_count = user_stats["active_users_count"]
+    total_unique_users = user_stats["total_unique_users"]
+    user_sessions_dict = user_stats["sessions"]
+
+    # Fetch User Upload & Prediction Logs
+    logs = load_upload_logs()
+    total_tests = len(logs)
+    
+    # Calculate Identified vs Not Identified / Unknown Combined Results
+    identified_logs = [l for l in logs if not l.get("is_unknown", False)]
+    unidentified_logs = [l for l in logs if l.get("is_unknown", False)]
+    
+    identified_count = len(identified_logs)
+    unidentified_count = len(unidentified_logs)
+    
+    identified_pct = (identified_count / total_tests * 100.0) if total_tests > 0 else 0.0
+    unidentified_pct = (unidentified_count / total_tests * 100.0) if total_tests > 0 else 0.0
+    avg_confidence = float(np.mean([l.get("confidence", 0.0) for l in logs])) if total_tests > 0 else 0.0
+
+    # Count predicted classes breakdown
+    class_counts = {}
+    for l in logs:
+        cls = l.get("predicted_class", "Unknown")
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+    
+    top_class = max(class_counts, key=class_counts.get) if class_counts else "N/A"
+
+    # Top Admin Header
+    st.markdown(
+        f"""
+        <div class="top-taskbar" style="border-color: rgba(236, 72, 153, 0.5);">
+            <div class="taskbar-brand">
+                <div class="taskbar-logo" style="background: radial-gradient(circle, #ec4899 0%, #8b5cf6 100%);">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                </div>
+                <div>
+                    <div class="taskbar-title">NAKSH AI ADMIN CONTROL CENTER</div>
+                    <div class="taskbar-sub">Real-Time User Statistics & Combined Model Prediction Telemetry</div>
+                </div>
+            </div>
+            <div class="taskbar-metrics">
+                <div class="taskbar-chip" style="color: #34d399; border-color: rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.12);">
+                    <span class="taskbar-pulse" style="background: #34d399; box-shadow: 0 0 10px #34d399;"></span>
+                    {active_users_count} ACTIVE USER{'S' if active_users_count != 1 else ''} ONLINE
+                </div>
+                <div class="taskbar-chip" style="color: #f472b6; border-color: rgba(236, 72, 153, 0.4); background: rgba(236, 72, 153, 0.15);">
+                    <span class="taskbar-pulse" style="background: #ec4899; box-shadow: 0 0 10px #ec4899;"></span>
+                    ADMINISTRATOR
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Top Navigation Row
+    n1, n2, n3 = st.columns([1, 1, 1])
+    with n1:
+        if st.button("Return to User Dashboard", key="btn_admin_nav_dash"):
+            st.session_state["page"] = "dashboard"
+            st.rerun()
+    with n2:
+        if st.button("Return to 3D Intro", key="btn_admin_nav_intro"):
+            st.session_state["page"] = "intro"
+            st.rerun()
+    with n3:
+        if st.button("Logout Admin Session", key="btn_admin_logout"):
+            st.session_state["admin_authenticated"] = False
+            st.session_state["page"] = "dashboard"
+            st.rerun()
+
+    st.write("")
+
+    # Overview Telemetry Metrics Row (5 Cards)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        st.markdown(
+            f"""
+            <div class="admin-metric-card" style="border-color: rgba(52, 211, 153, 0.4);">
+                <div class="admin-metric-lbl" style="color: #34d399;">REAL-TIME ACTIVE USERS</div>
+                <div class="admin-metric-val" style="color: #34d399;">{active_users_count}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m2:
+        st.markdown(
+            f"""
+            <div class="admin-metric-card">
+                <div class="admin-metric-lbl">TOTAL UNIQUE VISITORS</div>
+                <div class="admin-metric-val">{total_unique_users}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m3:
+        st.markdown(
+            f"""
+            <div class="admin-metric-card">
+                <div class="admin-metric-lbl">TOTAL MODEL TESTS</div>
+                <div class="admin-metric-val">{total_tests}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m4:
+        st.markdown(
+            f"""
+            <div class="admin-metric-card" style="border-color: rgba(6, 182, 212, 0.4);">
+                <div class="admin-metric-lbl" style="color: #38bdf8;">IDENTIFIED OBJECTS</div>
+                <div class="admin-metric-val" style="color: #38bdf8;">{identified_count} <span style="font-size: 0.95rem; color: #94a3b8;">({identified_pct:.1f}%)</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m5:
+        st.markdown(
+            f"""
+            <div class="admin-metric-card" style="border-color: rgba(236, 72, 153, 0.4);">
+                <div class="admin-metric-lbl" style="color: #f472b6;">NOT IDENTIFIED / UNKNOWN</div>
+                <div class="admin-metric-val" style="color: #f472b6;">{unidentified_count} <span style="font-size: 0.95rem; color: #94a3b8;">({unidentified_pct:.1f}%)</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+
+    # ADMIN DASHBOARD TABS
+    tab_combined, tab_users, tab_logs, tab_sandbox = st.tabs([
+        "📈 COMBINED RESULTS & SUMMARY REPORT",
+        "👥 REAL-TIME USERS TELEMETRY",
+        "📋 USER TEST AUDIT LOGS",
+        "🧪 ADMIN MODEL INFERENCE SANDBOX",
+    ])
+
+    # ------------------------------------------------------------
+    # TAB 1: COMBINED RESULTS & SUMMARY REPORT
+    # ------------------------------------------------------------
+    with tab_combined:
+        st.markdown("### Combined Model Prediction Results & Summary Statistics")
+        st.caption("Consolidated analytics comparing successfully identified celestial objects versus unrecognized / unknown uploads.")
+
+        # Executive Summary Alert Card
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, rgba(13, 18, 38, 0.95) 0%, rgba(22, 28, 60, 0.9) 100%); border: 1px solid rgba(139, 92, 246, 0.4); border-radius: 20px; padding: 22px 28px; margin-bottom: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+                <div style="font-size: 0.8rem; font-weight: 800; letter-spacing: 0.18em; color: #a78bfa; text-transform: uppercase; margin-bottom: 6px;">EXECUTIVE STATISTICAL SUMMARY</div>
+                <div style="font-size: 1.2rem; font-weight: 700; color: #ffffff; margin-bottom: 10px;">
+                    Out of <span style="color: #38bdf8; font-weight: 800;">{total_tests}</span> total user model tests, <span style="color: #34d399; font-weight: 800;">{identified_count}</span> ({identified_pct:.1f}%) were successfully identified and <span style="color: #f472b6; font-weight: 800;">{unidentified_count}</span> ({unidentified_pct:.1f}%) were categorized as Unknown / Unrecognized.
+                </div>
+                <div style="font-size: 0.88rem; color: #cbd5e1; line-height: 1.6;">
+                    • <strong>Average Confidence Across All Tests:</strong> {avg_confidence:.2f}%<br/>
+                    • <strong>Most Tested Celestial Object:</strong> {top_class.upper()}<br/>
+                    • <strong>Model Identification Confidence Guardrail:</strong> 75.0% threshold (Images under 75% trigger Unrecognized warning to prevent false positives).
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        c_col1, c_col2 = st.columns(2)
+
+        with c_col1:
+            st.markdown(
+                """
+                <div class="panel-card">
+                    <div class="panel-header-title">IDENTIFIED VS. NOT IDENTIFIED OBJECTS</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if total_tests > 0:
+                fig_pie, ax_pie = plt.subplots(figsize=(6, 4.2))
+                fig_pie.patch.set_facecolor('#0d1222')
+                ax_pie.set_facecolor('#0d1222')
+
+                pie_labels = ['Identified', 'Not Identified / Unknown']
+                pie_sizes = [identified_count, unidentified_count]
+                pie_colors = ['#06b6d4', '#ec4899']
+
+                wedges, texts, autotexts = ax_pie.pie(
+                    pie_sizes,
+                    labels=pie_labels,
+                    autopct='%1.1f%%',
+                    startangle=140,
+                    colors=pie_colors,
+                    textprops=dict(color='white', fontweight='bold'),
+                    wedgeprops=dict(width=0.45, edgecolor='#0d1222', linewidth=2),
+                )
+                for autotext in autotexts:
+                    autotext.set_color('white')
+                    autotext.set_fontsize(11)
+
+                ax_pie.set_title("Combined Classification Ratio", color='#a78bfa', fontsize=12, fontweight='bold', pad=12)
+                st.pyplot(fig_pie)
+            else:
+                st.info("No prediction data recorded yet to render donut chart.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with c_col2:
+            st.markdown(
+                """
+                <div class="panel-card">
+                    <div class="panel-header-title">CELESTIAL CLASS BREAKDOWN SUMMARY</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if class_counts:
+                fig_bar, ax_bar = plt.subplots(figsize=(6, 4.2))
+                fig_bar.patch.set_facecolor('#0d1222')
+                ax_bar.set_facecolor('#0d1222')
+
+                classes = list(class_counts.keys())
+                counts = list(class_counts.values())
+                colors_list = ['#8b5cf6', '#06b6d4', '#34d399', '#f59e0b', '#ec4899']
+
+                bars = ax_bar.bar(classes, counts, color=colors_list[:len(classes)], edgecolor='white', linewidth=0.8)
+                ax_bar.tick_params(colors='white', labelsize=10)
+                ax_bar.spines['bottom'].set_color('#334155')
+                ax_bar.spines['top'].set_color('none')
+                ax_bar.spines['right'].set_color('none')
+                ax_bar.spines['left'].set_color('#334155')
+                ax_bar.set_ylabel('Test Count', color='#94a3b8', fontsize=10)
+
+                for bar in bars:
+                    yval = bar.get_height()
+                    ax_bar.text(bar.get_x() + bar.get_width()/2, yval + 0.08, int(yval), ha='center', va='bottom', color='white', fontweight='bold')
+
+                st.pyplot(fig_bar)
+            else:
+                st.info("No celestial classification data recorded yet.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.write("")
+        st.markdown("### Category Summary Matrix")
+        
+        # Summary Table Matrix
+        summary_rows = []
+        all_categories = sorted(list(set(["Moon", "Nebula", "Planet", "Star", "Unknown"] + list(class_counts.keys()))))
+        for cat in all_categories:
+            cat_logs = [l for l in logs if l.get("predicted_class") == cat]
+            cnt = len(cat_logs)
+            pct = (cnt / total_tests * 100.0) if total_tests > 0 else 0.0
+            avg_conf = float(np.mean([l.get("confidence", 0) for l in cat_logs])) if cnt > 0 else 0.0
+            status_label = "NOT IDENTIFIED" if cat.lower() == "unknown" else "IDENTIFIED"
+            summary_rows.append({
+                "Category / Class": cat.upper(),
+                "Status": status_label,
+                "Tested Count": cnt,
+                "Percentage of Total": f"{pct:.1f}%",
+                "Average Confidence": f"{avg_conf:.2f}%",
+            })
+        
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------
+    # TAB 2: REAL-TIME USERS TELEMETRY
+    # ------------------------------------------------------------
+    with tab_users:
+        st.markdown("### Real-Time Active Users & Session Registry")
+        st.caption("Monitor active connected users, unique session IDs, first visit timestamps, and test counts.")
+
+        u_col1, u_col2 = st.columns(2)
+        with u_col1:
+            st.markdown(
+                f"""
+                <div class="admin-metric-card" style="border-color: rgba(52, 211, 153, 0.5);">
+                    <div class="admin-metric-lbl" style="color: #34d399;">ONLINE ACTIVE USERS (PAST 5 MINS)</div>
+                    <div class="admin-metric-val" style="color: #34d399;">{active_users_count} Users</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with u_col2:
+            st.markdown(
+                f"""
+                <div class="admin-metric-card" style="border-color: rgba(139, 92, 246, 0.5);">
+                    <div class="admin-metric-lbl" style="color: #c084fc;">TOTAL REGISTERED VISITORS</div>
+                    <div class="admin-metric-val" style="color: #c084fc;">{total_unique_users} Users</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.write("")
+        st.markdown("### User Sessions Detail Table")
+        
+        now_ts = time.time()
+        session_table_data = []
+        for uid, s_info in user_sessions_dict.items():
+            last_ts = s_info.get("last_seen_ts", 0)
+            is_active = (now_ts - last_ts) <= 300
+            session_table_data.append({
+                "Status": "🟢 ACTIVE ONLINE" if is_active else "⚪ INACTIVE",
+                "User Session ID": uid,
+                "First Active": s_info.get("first_seen", "N/A"),
+                "Last Active": s_info.get("last_seen", "N/A"),
+                "Model Tests Conducted": s_info.get("tests_count", 0),
+            })
+        
+        if session_table_data:
+            st.dataframe(pd.DataFrame(session_table_data), use_container_width=True, hide_index=True)
+        else:
+            st.info("No active user session telemetry recorded yet.")
+
+    # ------------------------------------------------------------
+    # TAB 3: USER TEST AUDIT LOGS
+    # ------------------------------------------------------------
+    with tab_logs:
+        st.markdown("### Detailed User Upload & Model Testing Audit Trail")
+        st.caption("Inspect individual user uploads, predicted objects, latency metrics, and probability distributions.")
+
+        ca, cb = st.columns([3, 1])
+        with ca:
+            filter_class = st.selectbox("Filter Logs by Predicted Class", ["ALL CLASSES"] + list(class_counts.keys()))
+        with cb:
+            if st.button("CLEAR ALL AUDIT LOGS", key="btn_clear_logs"):
+                clear_upload_logs()
+                st.success("Audit logs cleared successfully!")
+                time.sleep(0.4)
+                st.rerun()
+
+        filtered_logs = logs
+        if filter_class != "ALL CLASSES":
+            filtered_logs = [l for l in logs if l.get("predicted_class") == filter_class]
+
+        if not filtered_logs:
+            st.info("No user upload logs recorded yet. Go to the User Dashboard and upload an astronomical image to see real-time logging in action!")
+        else:
+            # Display Export Option
+            df_export = pd.DataFrame(filtered_logs)
+            if not df_export.empty and "probabilities" in df_export.columns:
+                df_export_clean = df_export.drop(columns=["probabilities"], errors="ignore")
+            else:
+                df_export_clean = df_export
+                
+            csv_data = df_export_clean.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Export Audit Logs as CSV",
+                csv_data,
+                "naksh_ai_user_upload_logs.csv",
+                "text/csv",
+                key="btn_download_csv",
+            )
+
+            st.write("")
+
+            # Log Items List
+            for idx, log in enumerate(filtered_logs):
+                status_icon = "⚠️ NOT IDENTIFIED / UNKNOWN" if log.get('is_unknown') else "✅ IDENTIFIED"
+                with st.expander(
+                    f"📅 {log.get('timestamp')} | {log.get('user_id')} | File: '{log.get('filename')}' ➔ {status_icon}: {log.get('predicted_class').upper()} ({log.get('confidence'):.2f}%)",
+                    expanded=(idx == 0),
+                ):
+                    lc1, lc2 = st.columns([1, 2])
+                    with lc1:
+                        img_path = log.get("saved_image_path")
+                        if img_path and os.path.exists(img_path):
+                            st.image(img_path, caption=f"Uploaded Observation: {log.get('filename')}", use_container_width=True)
+                        else:
+                            st.caption("Uploaded image preview unavailable")
+                    
+                    with lc2:
+                        st.markdown(f"**Log Record ID**: `{log.get('id')}`")
+                        st.markdown(f"**User Session ID**: `{log.get('user_id')}`")
+                        st.markdown(f"**Timestamp**: `{log.get('timestamp')}`")
+                        st.markdown(f"**Inference Latency**: `{log.get('inference_time_ms', 40.0):.2f} ms`")
+                        st.markdown(f"**Result Status**: `{'NOT IDENTIFIED / UNKNOWN (<75%)' if log.get('is_unknown') else 'IDENTIFIED CELESTIAL OBJECT'}`")
+                        
+                        st.write("---")
+                        st.markdown("**Predicted Class Probabilities Distribution**")
+                        probs = log.get("probabilities", {})
+                        for pname, pval in probs.items():
+                            st.caption(f"{pname.upper()}: {pval:.2f}%")
+                            st.progress(min(max(pval / 100.0, 0.0), 1.0))
+
+    # ------------------------------------------------------------
+    # TAB 4: ADMIN LIVE MODEL INFERENCE SANDBOX
+    # ------------------------------------------------------------
+    with tab_sandbox:
+        st.markdown("### Admin Live Model Inference & Activation Sandbox")
+        st.caption("Directly upload test images in admin mode to inspect confidence layers, raw logit arrays, and feature attention.")
+
+        test_file = st.file_uploader("Upload Image to Test Model", type=["jpg", "jpeg", "png"], key="admin_sandbox_uploader")
+        if test_file is not None:
+            admin_img = Image.open(test_file).convert("RGB")
+            sb1, sb2 = st.columns(2)
+            with sb1:
+                st.image(admin_img, caption=f"Sandbox Input: {test_file.name}", use_container_width=True)
+            
+            with sb2:
+                # Load model & predict
+                try:
+                    m = tf.keras.models.load_model(str(MODEL_PATH))
+                    with open(CLASS_NAMES_PATH, "r", encoding="utf-8") as f:
+                        c_names = json.load(f)
+                    
+                    resized = admin_img.resize((224, 224))
+                    img_arr = np.expand_dims(np.asarray(resized).astype(np.float32), axis=0)
+                    
+                    t0 = time.time()
+                    preds = m.predict(img_arr, verbose=0)
+                    t1 = time.time()
+                    
+                    pidx = int(np.argmax(preds[0]))
+                    pclass = c_names[pidx]
+                    conf = float(preds[0][pidx])
+                    
+                    st.success(f"Predicted Class: **{pclass.upper()}** ({conf * 100:.2f}%)")
+                    st.caption(f"Inference Latency: {(t1 - t0) * 1000:.2f} ms")
+                    
+                    st.markdown("**Raw Softmax Logit Array**")
+                    st.code(str(preds[0]), language="json")
+                except Exception as ex:
+                    st.error(f"Sandbox Inference Error: {ex}")
 
 
 # ============================================================
@@ -1906,6 +2762,13 @@ def render_dashboard_page():
         if st.button("Return to Intro", key="btn_sb_nav_intro"):
             st.session_state["page"] = "intro"
             st.rerun()
+
+        if st.button("Admin Control Portal", key="btn_sb_nav_admin"):
+            st.session_state["page"] = "admin"
+            st.rerun()
+
+        if st.button("Upload Section", key="btn_sb_nav_upload"):
+            st.components.v1.html("<script>window.parent.document.getElementById('upload-section')?.scrollIntoView({behavior: 'smooth'});</script>", height=0)
 
         st.markdown('<div class="sb-section-title">CELESTIAL CATALOGUE</div>', unsafe_allow_html=True)
 
@@ -2132,7 +2995,7 @@ def render_dashboard_page():
     with col_left:
         st.markdown(
             """
-            <div class="panel-header-title" style="text-align: center;">CLASSIFY ASTRONOMICAL IMAGE</div>
+            <div id="upload-section" class="panel-header-title" style="text-align: center;">CLASSIFY ASTRONOMICAL IMAGE</div>
             """,
             unsafe_allow_html=True,
         )
@@ -2161,7 +3024,11 @@ def render_dashboard_page():
                     image_array = np.asarray(resized).astype(np.float32)
                     image_array = np.expand_dims(image_array, axis=0)
 
+                    t_start = time.time()
                     predictions = model.predict(image_array, verbose=0)
+                    t_end = time.time()
+                    latency_ms = (t_end - t_start) * 1000.0
+
                     predicted_index = int(np.argmax(predictions[0]))
                     predicted_class = class_names[predicted_index]
                     confidence = float(predictions[0][predicted_index])
@@ -2175,6 +3042,38 @@ def render_dashboard_page():
                             heatmap, _ = make_gradcam_heatmap(image, model, "conv_1")
                         except Exception as err:
                             st.warning(f"Grad-CAM generation issue: {err}")
+
+                    # REAL-TIME LOGGING TO ADMIN PORTAL STORAGE
+                    timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    time_id = int(time.time())
+                    saved_img_name = f"{time_id}_{uploaded_file.name}"
+                    saved_img_path = UPLOADS_DIR / saved_img_name
+                    image.save(saved_img_path)
+
+                    prob_dict = {
+                        name: float(predictions[0][idx]) * 100.0
+                        for idx, name in enumerate(class_names)
+                    }
+
+                    log_entry = {
+                        "id": f"LOG_{time_id}_{st.session_state['user_session_id']}",
+                        "timestamp": timestamp_str,
+                        "user_id": st.session_state["user_session_id"],
+                        "filename": uploaded_file.name,
+                        "saved_image_path": str(saved_img_path),
+                        "predicted_class": "Unknown" if is_unknown else predicted_class.capitalize(),
+                        "confidence": float(confidence * 100.0),
+                        "is_unknown": is_unknown,
+                        "probabilities": prob_dict,
+                        "inference_time_ms": float(latency_ms),
+                    }
+
+                    # Prevent duplicate logging on rerun
+                    last_logged_id = st.session_state.get("last_logged_id")
+                    if last_logged_id != log_entry["id"]:
+                        save_upload_log(log_entry)
+                        record_user_test(st.session_state["user_session_id"])
+                        st.session_state["last_logged_id"] = log_entry["id"]
 
             st.write("")
             st.markdown(
@@ -2335,5 +3234,7 @@ def render_dashboard_page():
 
 if st.session_state["page"] == "intro":
     render_intro_page()
+elif st.session_state["page"] == "admin":
+    render_admin_page()
 else:
     render_dashboard_page()
