@@ -612,7 +612,7 @@ def show_moon_dialog():
     )
 
 
-@st.dialog("Celestial Component Details: Nebula 🌌")
+@st.dialog("Celestial Component Details: Nebula ")
 def show_nebula_dialog():
     st.image(str(ASSETS_DIR / "nebula.jpg"), caption="Interstellar Cloud Observation", use_container_width=True)
     st.markdown(
@@ -631,7 +631,7 @@ def show_nebula_dialog():
     )
 
 
-@st.dialog("Celestial Component Details: Planet 🪐")
+@st.dialog("Celestial Component Details: Planet ")
 def show_planet_dialog():
     st.image(str(ASSETS_DIR / "planet.jpg"), caption="Planetary Body Observation", use_container_width=True)
     st.markdown(
@@ -650,7 +650,7 @@ def show_planet_dialog():
     )
 
 
-@st.dialog("Celestial Component Details: Star 🌟")
+@st.dialog("Celestial Component Details: Star ")
 def show_star_dialog():
     st.image(str(ASSETS_DIR / "star.jpg"), caption="Stellar Object Observation", use_container_width=True)
     st.markdown(
@@ -669,7 +669,7 @@ def show_star_dialog():
     )
 
 
-@st.dialog("Technology Component: MobileNetV3Small ⚡")
+@st.dialog("Technology Component: MobileNetV3Small ")
 def show_mobilenet_dialog():
     st.markdown(
         """
@@ -686,7 +686,7 @@ def show_mobilenet_dialog():
     )
 
 
-@st.dialog("Technology Component: Transfer Learning 🔄")
+@st.dialog("Technology Component: Transfer Learning ")
 def show_transfer_dialog():
     st.markdown(
         """
@@ -703,7 +703,7 @@ def show_transfer_dialog():
     )
 
 
-@st.dialog("Technology Component: TensorFlow & Keras 🤖")
+@st.dialog("Technology Component: TensorFlow & Keras ")
 def show_tf_dialog():
     st.markdown(
         """
@@ -720,7 +720,7 @@ def show_tf_dialog():
     )
 
 
-@st.dialog("Technology Component: Grad-CAM Explainability 🔥")
+@st.dialog("Technology Component: Grad-CAM Explainability ")
 def show_gradcam_dialog():
     st.markdown(
         """
@@ -737,7 +737,7 @@ def show_gradcam_dialog():
     )
 
 
-@st.dialog("Technology Component: Python 🐍")
+@st.dialog("Technology Component: Python ")
 def show_python_dialog():
     st.markdown(
         """
@@ -756,7 +756,7 @@ def show_python_dialog():
     )
 
 
-@st.dialog("Technology Component: Streamlit 🚀")
+@st.dialog("Technology Component: Streamlit ")
 def show_streamlit_dialog():
     st.markdown(
         """
@@ -800,35 +800,35 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if st.button("📷 Image classification", key="nav_img_cls"):
+    if st.button("Image classification", key="nav_img_cls"):
         st.toast("Active section: Image classification")
-    if st.button("👁️ Explainable AI (Grad-CAM)", key="nav_exp_ai"):
+    if st.button("Explainable AI (Grad-CAM)", key="nav_exp_ai"):
         show_gradcam_dialog()
-    if st.button("📈 Prediction analysis", key="nav_pred_an"):
+    if st.button("Prediction analysis", key="nav_pred_an"):
         show_transfer_dialog()
-    if st.button("📊 Model performance", key="nav_mod_perf"):
+    if st.button("Model performance", key="nav_mod_perf"):
         st.toast("Accuracy: 98.26% on 690 test images")
 
     st.markdown('<div class="sb-section-title">RECOGNIZED OBJECTS</div>', unsafe_allow_html=True)
 
-    if st.button("🌖  Moon (Natural Satellite)", key="btn_sb_moon"):
+    if st.button("Moon (Natural Satellite)", key="btn_sb_moon"):
         show_moon_dialog()
-    if st.button("🌌  Nebula (Gas & Dust)", key="btn_sb_nebula"):
+    if st.button("Nebula (Gas & Dust)", key="btn_sb_nebula"):
         show_nebula_dialog()
-    if st.button("🪐  Planet (Planetary Body)", key="btn_sb_planet"):
+    if st.button("Planet (Planetary Body)", key="btn_sb_planet"):
         show_planet_dialog()
-    if st.button("🌟  Star (Luminous Plasma)", key="btn_sb_star"):
+    if st.button("Star (Luminous Plasma)", key="btn_sb_star"):
         show_star_dialog()
 
     st.markdown('<div class="sb-section-title">MODEL ARCHITECTURE</div>', unsafe_allow_html=True)
 
-    if st.button("⚡ MobileNetV3Small", key="btn_arch_mobilenet"):
+    if st.button("MobileNetV3Small", key="btn_arch_mobilenet"):
         show_mobilenet_dialog()
-    if st.button("🔄 Transfer learning", key="btn_arch_transfer"):
+    if st.button("Transfer learning", key="btn_arch_transfer"):
         show_transfer_dialog()
-    if st.button("🤖 TensorFlow / Keras", key="btn_arch_tf"):
+    if st.button("TensorFlow / Keras", key="btn_arch_tf"):
         show_tf_dialog()
-    if st.button("🔥 Grad-CAM Explainability", key="btn_arch_gradcam"):
+    if st.button("Grad-CAM Explainability", key="btn_arch_gradcam"):
         show_gradcam_dialog()
 
     st.markdown(
@@ -898,7 +898,7 @@ with col_exp1:
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Explore Moon 🌖", key="btn_exp_moon"):
+    if st.button("Explore Moon ", key="btn_exp_moon"):
         show_moon_dialog()
 
 with col_exp2:
@@ -915,7 +915,7 @@ with col_exp2:
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Explore Nebula 🌌", key="btn_exp_nebula"):
+    if st.button("Explore Nebula ", key="btn_exp_nebula"):
         show_nebula_dialog()
 
 with col_exp3:
@@ -949,7 +949,7 @@ with col_exp4:
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Explore Star 🌟", key="btn_exp_star"):
+    if st.button("Explore Star ", key="btn_exp_star"):
         show_star_dialog()
 
 
